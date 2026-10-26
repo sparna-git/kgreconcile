@@ -35,8 +35,6 @@ The candidates are printed on stdout as JSON, one entry per label:
 }
 ```
 
-The logs go to stderr, so `> results.json` keeps the JSON alone. `--quiet` removes them.
-
 ### Commands
 
 `reconcile <label>...` reconciles one or more labels.
@@ -66,7 +64,7 @@ Without a config file, for a quick test on an endpoint:
 - `--index=<file>` is the `indexCachePath`, for `LunrReconcileService`.
 
 ```sh
-npx kgreconcile reconcile "Victor Hugo" --endpoint=https://example.org/sparql --shacl=./shapes.ttl
+npx kgreconcile reconcile "Victor Hugo" --endpoint=SPARQL_endpoint --shacl=SHACL_file
 ```
 
 The paths given in the options and in the config file are relative to the current directory.
@@ -103,70 +101,3 @@ The services, to put in `implementation`:
 - `IsidoreApiReconcileService`: calls the suggest API of ISIDORE.
 
 They accept `cacheSize` and `maxResults`, except the last one.
-
-### Lunr index
-
-```yaml
-reconciliation:
-  implementation: LunrReconcileService
-  maxResults: 6
-  indexCachePath: ./cache/ep/lunr-index.json
-  sparqlQueries:
-    - field: label
-      boost: 10
-      queryFiles:
-        - ./config/ep/sparqlqueriesindex/rdfs_label.rq
-        - ./config/ep/sparqlqueriesindex/skos_prefLabel.rq
-    - field: altLabel
-      boost: 5
-      queryFile: ./config/ep/sparqlqueriesindex/skos_altLabel.rq
-```
-
-Each query returns `?entity ?value` rows, and each value is indexed in the field of its query. A field takes one query (`query`, inline), one file (`queryFile`) or several (`queryFiles`). Without `sparqlQueries`, the index holds the `rdfs:label` in French or without a language.
-
-The first use builds the index from the SPARQL endpoint and saves it in `indexCachePath`. The next ones load that file. Delete it, or run `index --force`, to build it again. Without `indexCachePath`, the index is built in memory at each start.
-
-A large index needs memory: the RUIM one holds 167,000 entities and takes 250 MB on disk. If Node runs out of memory, give it more with `NODE_OPTIONS=--max-old-space-size=8192`.
-
-## Library
-
-Add kgreconcile to the dependencies of the other project, in one of two ways.
-
-From the npm registry, once it is published:
-
-```sh
-npm install kgreconcile
-```
-
-Or from a local copy, to use a version that is not published:
-
-```sh
-npm pack                                          # in kgreconcile, writes kgreconcile-0.1.0.tgz
-npm install ../kgreconcile/kgreconcile-0.1.0.tgz  # in the other project
-```
-
-`npm pack` builds the project first. Run both commands again after a change in kgreconcile: as long as the version stays 0.1.0, a plain `npm install` keeps the old copy.
-
-```ts
-import { createReconcileService, warmUpLunrIndexes } from "kgreconcile";
-
-// the config of one project, as in the "projects" section above
-const service = createReconcileService("my-project", projectConfig);
-
-const output = await service.reconcileQueries(
-  { q0: { query: "Victor Hugo" } },
-  false, // includeTypes
-);
-
-// once at startup, so that the first call does not wait for the index
-warmUpLunrIndexes({ "my-project": service });
-```
-
-`createReconcileService` builds a new service at each call, with its own cache and its own index. Keep the instance and reuse it.
-
-kgreconcile does not read any config file by itself: the host project passes the config of each project. `loadConfigFile(path)` reads a YAML file in the format above, for a project that has none of its own. `setLogLevel(level)` sets the level of the logs, `info` by default.
-
-## Build
-
-- `npm run build` compiles to `dist`.
-- `npm run cli -- <command>` runs the command line from the sources, with ts-node.
