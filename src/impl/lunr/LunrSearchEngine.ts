@@ -6,6 +6,8 @@ import logger from "../../utils/logger";
 export class LunrSearchEngine {
   // Top result must be this much better (relatively) than the 2nd to be a definitive match
   private static MATCH_MIN_GAP = 0.3;
+  // In the wildcard search, a word identical to the query weighs this much more than its extensions
+  private static EXACT_WORD_BOOST = 10;
 
   constructor(
     private readonly index: lunr.Index,
@@ -32,7 +34,7 @@ export class LunrSearchEngine {
     if (filtered.length === 0) return [];
 
     const maxScore = filtered[0].score;
-    const isMatch = this.isConfidentMatch(filtered, mode);
+    const isMatch = this.isConfidentMatch(filtered, mode, sanitized);
 
     return filtered.slice(0, this.maxResults).map((r, i) => ({
       id: r.ref,
@@ -59,16 +61,23 @@ export class LunrSearchEngine {
     const tokens = sanitized.split(/\s+/).filter(Boolean);
     const fields = [...this.fieldBoosts.entries()];
 
-    // 1. Wildcard suffix — best for partial/autocomplete input
+    // 1. Wildcard suffix — best for partial/autocomplete input. The exact word is
+    //    added with a higher boost: otherwise a rare extension of the word
+    //    ("orale/rectale") outscores the word itself ("orale"), which is frequent.
     try {
       const results = this.index.query((q) => {
         for (const token of tokens)
-          for (const [field, boost] of fields)
+          for (const [field, boost] of fields) {
+            q.term(token, {
+              fields: [field],
+              boost: boost * LunrSearchEngine.EXACT_WORD_BOOST,
+            });
             q.term(token, {
               fields: [field],
               boost,
               wildcard: lunr.Query.wildcard.TRAILING,
             });
+          }
       });
       if (results.length > 0) return { results, mode: "wildcard" };
     } catch {}
@@ -118,13 +127,26 @@ export class LunrSearchEngine {
   private isConfidentMatch(
     results: lunr.Index.Result[],
     mode: SearchMode,
+    sanitized: string,
   ): boolean {
     // Fuzzy results are inherently uncertain — never auto-accept
     if (mode === "fuzzy") return false;
     // Single result with no competition is always a confident match
     if (results.length === 1) return true;
+    // Top result has exactly the searched label (case and accents aside), and no other result has it
+    if (
+      this.hasLabel(results[0], sanitized) &&
+      !results.slice(1).some((r) => this.hasLabel(r, sanitized))
+    )
+      return true;
     // Top result must be at least MATCH_MIN_GAP relatively better than the second
     const gap = (results[0].score - results[1].score) / results[0].score;
     return gap >= LunrSearchEngine.MATCH_MIN_GAP;
+  }
+
+  private hasLabel(result: lunr.Index.Result, sanitized: string): boolean {
+    return (
+      this.sanitize(this.uriToData.get(result.ref)?.label ?? "") === sanitized
+    );
   }
 }
