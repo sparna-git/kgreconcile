@@ -18,7 +18,7 @@ import {
   injectResolvedUris,
 } from "../../helpers/UriReconciliationHelperV13";
 import logger from "../../utils/logger";
-import { UriData } from "./types";
+import { TypedIndex } from "./types";
 import { ReconcileCache } from "./ReconcileCache";
 import { LunrIndexBuilder } from "./LunrIndexBuilder";
 import { LunrIndexStore } from "./LunrIndexStore";
@@ -138,6 +138,7 @@ export class LunrReconcileService implements ReconcileServiceIfc {
       } else {
         logger.info({}, `[lunr-recon] Reconciling: "${name}"`);
         results = this.engine!.search(name, qobj.type);
+        if (includeTypes) results = results.map(withTypeNames);
         this.cache.set(cacheKey, results);
         this.logResult(name, results, "lunr");
       }
@@ -209,37 +210,18 @@ export class LunrReconcileService implements ReconcileServiceIfc {
       this.initialShaclTypes,
     );
 
-    let index: import("lunr").Index;
-    let uriToData: Map<string, UriData>;
-
+    // The saved index when there is one, unless a rebuild is asked
+    let groups: TypedIndex | null = null;
     if (!rebuild && this.store && (await this.store.exists())) {
-      const loaded = await this.store.load();
-      if (loaded) {
-        ({ index, uriToData } = loaded);
-        if (shaclTypes.length > 0) {
-          const hasTypes = [...uriToData.values()].some(
-            (d) => d.types && d.types.length > 0,
-          );
-          if (!hasTypes) {
-            logger.info(
-              {},
-              `[lunr-recon] Type data missing from cache — loading from SPARQL.`,
-            );
-            await this.builder.loadTypesFromSparql(uriToData, shaclTypes);
-          }
-        }
-      } else {
-        ({ index, uriToData } = await this.builder.build(shaclTypes));
-        await this.store.save(index, uriToData);
-      }
-    } else {
-      ({ index, uriToData } = await this.builder.build(shaclTypes));
-      if (this.store) await this.store.save(index, uriToData);
+      groups = await this.store.load();
+    }
+    if (!groups) {
+      groups = await this.builder.build(shaclTypes);
+      if (this.store) await this.store.save(groups);
     }
 
     this.engine = new LunrSearchEngine(
-      index,
-      uriToData,
+      groups,
       this.fieldBoosts,
       this.maxResults,
     );
@@ -307,4 +289,20 @@ export class LunrReconcileService implements ReconcileServiceIfc {
     }
     throw new Error("Invalid queries format");
   }
+}
+
+/**
+ * OpenRefine wants each type as { id, name }: the name is the end of the IRI.
+ * The cast is needed because `ReconcileResultWithTypes` also inherits
+ * `type?: string[]` from `ReconcileResultBase`.
+ */
+function withTypeNames(result: ReconcileResult): ReconcileResult {
+  if (!result.type) return result;
+  return {
+    ...result,
+    type: (result.type as string[]).map((id) => ({
+      id,
+      name: id.split(/[/#]/).pop() || id,
+    })),
+  } as unknown as ReconcileResult;
 }

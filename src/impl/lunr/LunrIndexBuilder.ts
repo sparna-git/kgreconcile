@@ -4,9 +4,21 @@ import fs from "fs";
 import lunr from "lunr";
 import { FieldQueryConfig } from "../../config/ReconcileConfig";
 import { getSHACLConfig, listNodeShapeIris } from "../../config/SHACL";
-import { SparqlBinding, FieldBinding, LegacyBinding, UriData } from "./types";
-import { normalizeAccents } from "./lunrPipeline";
+import {
+  SparqlBinding,
+  FieldBinding,
+  LegacyBinding,
+  TypedIndex,
+  UNTYPED_GROUP,
+} from "./types";
+import { normalizeAccents, trimNonWord } from "./lunrPipeline";
 import logger from "../../utils/logger";
+
+/** What the queries of the config bring for one entity. */
+type EntityLabels = {
+  displayLabel: string | null;
+  fields: Record<string, Set<string>>;
+};
 
 export class LunrIndexBuilder {
   constructor(
@@ -47,18 +59,20 @@ export class LunrIndexBuilder {
     }
   }
 
-  async build(
-    shaclTypes: string[],
-  ): Promise<{ index: lunr.Index; uriToData: Map<string, UriData> }> {
+  /**
+   * Builds the index of the project, one group per type: the labels come from
+   * the queries of the config, the types from `loadTypesFromSparql`, then each
+   * entity goes into the group of each of its types, or into the untyped
+   * group, and each group gets its own Lunr index.
+   */
+  async build(shaclTypes: string[]): Promise<TypedIndex> {
     logger.info(
       {},
       `[lunr-recon] Building lunr index for project "${this.projectId}"`,
     );
 
-    const dataByUri = new Map<
-      string,
-      { displayLabel: string | null; fields: Record<string, Set<string>> }
-    >();
+    // 1. The labels of each entity
+    const dataByUri = new Map<string, EntityLabels>();
 
     if (this.fieldQueries.length > 0) {
       const allBindings = await Promise.all(
@@ -105,63 +119,100 @@ export class LunrIndexBuilder {
       );
     }
 
-    const uriToData = new Map<string, UriData>();
-    for (const [uri, { displayLabel, fields }] of dataByUri) {
-      const label =
-        displayLabel ?? Object.values(fields).flatMap((s) => [...s])[0] ?? uri;
-      const arrayFields: Record<string, string[]> = {};
-      for (const [f, set] of Object.entries(fields)) arrayFields[f] = [...set];
-      uriToData.set(uri, { label, fields: arrayFields });
+    // 2. The types of each entity
+    const typesByUri =
+      shaclTypes.length > 0
+        ? await this.loadTypesFromSparql(new Set(dataByUri.keys()), shaclTypes)
+        : new Map<string, Set<string>>();
+
+    // 3. Each entity into the group of each of its types, or the untyped group
+    const members = new Map<string, string[]>();
+    for (const uri of dataByUri.keys()) {
+      const types = typesByUri.get(uri);
+      const keys = types && types.size > 0 ? [...types] : [UNTYPED_GROUP];
+      for (const key of keys) {
+        if (!members.has(key)) members.set(key, []);
+        members.get(key)!.push(uri);
+      }
     }
 
+    // 4. One Lunr index per group
+    const groups: TypedIndex = new Map();
+    for (const [key, uris] of members) {
+      const names = new Map<string, string>();
+      for (const uri of uris) {
+        const { displayLabel, fields } = dataByUri.get(uri)!;
+        names.set(
+          uri,
+          displayLabel ?? Object.values(fields).flatMap((s) => [...s])[0] ?? uri,
+        );
+      }
+      groups.set(key, {
+        index: this.createLunrIndex(uris, dataByUri),
+        names,
+      });
+      logger.info(
+        {},
+        `[lunr-recon] Group "${key}": ${uris.length} entity(ies).`,
+      );
+    }
+
+    logger.info(
+      {},
+      `[lunr-recon] Index built: ${dataByUri.size} entity(ies) in ${groups.size} group(s), fields: [${[...this.fieldBoosts.keys()].join(", ")}].`,
+    );
+
+    return groups;
+  }
+
+  /** The Lunr index of the given entities, one document per entity. */
+  private createLunrIndex(
+    uris: string[],
+    dataByUri: Map<string, EntityLabels>,
+  ): lunr.Index {
     const fieldBoosts = this.fieldBoosts;
-    const index = lunr(function () {
+    return lunr(function () {
       this.ref("id");
+      // Words of the index: accents removed first, then the punctuation around
+      // the word, in any alphabet. lunr.trimmer is replaced: it only knows the
+      // ASCII letters and ran before the accents were removed.
+      this.pipeline.remove(lunr.trimmer);
       this.pipeline.remove(lunr.stemmer);
       this.pipeline.remove(lunr.stopWordFilter);
-      this.pipeline.add(normalizeAccents);
+      this.pipeline.add(normalizeAccents, trimNonWord);
+      // Words of a search: no trimming here, it would remove the "*" of the
+      // prefix search; the words are trimmed before, in LunrSearchEngine.sanitize.
       this.searchPipeline.remove(lunr.stemmer);
       this.searchPipeline.add(normalizeAccents);
       for (const [field, boost] of fieldBoosts) {
         this.field(field, { boost });
       }
-      for (const [uri, { fields }] of dataByUri) {
+      for (const uri of uris) {
         const doc: Record<string, string> = { id: uri };
-        for (const [field, values] of Object.entries(fields)) {
+        for (const [field, values] of Object.entries(
+          dataByUri.get(uri)!.fields,
+        )) {
           if (values.size > 0) doc[field] = [...values].join(" ");
         }
         this.add(doc);
       }
     });
-
-    logger.info(
-      {},
-      `[lunr-recon] Index built: ${dataByUri.size} entity(ies), fields: [${[...fieldBoosts.keys()].join(", ")}].`,
-    );
-
-    if (shaclTypes.length > 0) {
-      await this.loadTypesFromSparql(uriToData, shaclTypes);
-    }
-
-    return { index, uriToData };
   }
 
   /**
-   * Tags each indexed entity with the types it belongs to, which is what
-   * `LunrSearchEngine` filters on when a `type` is passed.
+   * The types of the given entities, among `shaclTypes`.
    *
    * One `?entity a <type>` branch per type, then `expandSparql` rewrites them
    * against the data: a `sh:targetClass` becomes its class, a `sh:select`
    * becomes its own pattern. Same translation as the SPARQL and Lucene
-   * services. The substitution also hits the `BIND`, so a class shape tags
-   * with its class and a `sh:select` shape with the shape IRI.
+   * services. The `BIND` keeps the type as written in the config, which
+   * needs rdf-shacl-commons 0.3.7: before, the rewriting of a `sh:targetClass`
+   * also hit the `BIND`.
    */
-  async loadTypesFromSparql(
-    uriToData: Map<string, UriData>,
+  private async loadTypesFromSparql(
+    uris: Set<string>,
     shaclTypes: string[],
-  ): Promise<void> {
-    if (shaclTypes.length === 0) return;
-
+  ): Promise<Map<string, Set<string>>> {
     const branches = shaclTypes
       .map((t) => `  { ?entity a <${t}> . BIND(<${t}> AS ?value) }`)
       .join("\n  UNION\n");
@@ -182,24 +233,35 @@ export class LunrIndexBuilder {
 
     const bindings = await this.fetchTargetBindings(query);
 
-    let tagged = 0;
+    const known = new Set(shaclTypes);
+    const typesByUri = new Map<string, Set<string>>();
+    let unknown = 0;
     for (const b of bindings) {
       if (!b.entity || !b.value) continue;
-      const data = uriToData.get(b.entity.value);
-      if (!data) continue; // no label, so not in the index
-      if (!data.types) data.types = [];
-      if (data.types.includes(b.value.value)) continue;
-      data.types.push(b.value.value);
-      tagged++;
+      const uri = b.entity.value;
+      if (!uris.has(uri)) continue; // no label, so not in the index
+      if (!known.has(b.value.value)) {
+        unknown++;
+        continue;
+      }
+      if (!typesByUri.has(uri)) typesByUri.set(uri, new Set());
+      typesByUri.get(uri)!.add(b.value.value);
     }
 
     logger.info(
       {},
-      `[lunr-recon] Types loaded: ${bindings.length} row(s) for ${shaclTypes.length} type(s), ${tagged} tagged.`,
+      `[lunr-recon] Types loaded: ${bindings.length} row(s) for ${shaclTypes.length} type(s), ${typesByUri.size} entity(ies) typed.`,
     );
+    if (unknown > 0) {
+      logger.warn(
+        {},
+        `[lunr-recon] ${unknown} row(s) came back with a type that is not in shaclTypes: rdf-shacl-commons older than 0.3.7 rewrites the BIND of a sh:targetClass shape. Those entities go to the untyped group.`,
+      );
+    }
+    return typesByUri;
   }
 
-  /** POST for the type query: no keep-alive and IPv4, as the large RUIM one needs. */
+  /** POST for the type query: no keep-alive and IPv4, which the large type queries need. */
   private async fetchTargetBindings(query: string): Promise<SparqlBinding[]> {
     const response = await axios.post<{
       results: { bindings: SparqlBinding[] };

@@ -1,9 +1,22 @@
 import fs from "fs";
 import path from "path";
 import lunr from "lunr";
-import { UriData } from "./types";
+import { TypedIndex } from "./types";
 import logger from "../../utils/logger";
 
+/**
+ * Version of the way the words are stored, written in the file. A file of
+ * another version is rebuilt: 2 = punctuation trimmed in any alphabet, after
+ * the accents are removed.
+ */
+const INDEX_VERSION = 2;
+
+/**
+ * Saves the index of a project to a JSON file and loads it back, one entry per
+ * type group:
+ *
+ *   { "version": 2, "groups": { "<type>": { "index": <Lunr index>, "names": { "<uri>": "<name>" } } } }
+ */
 export class LunrIndexStore {
   constructor(private readonly filePath: string) {}
 
@@ -16,51 +29,40 @@ export class LunrIndexStore {
     }
   }
 
-  async load(): Promise<{
-    index: lunr.Index;
-    uriToData: Map<string, UriData>;
-  } | null> {
+  /** The saved index, or null when the file cannot be read or has an older format. */
+  async load(): Promise<TypedIndex | null> {
     try {
       logger.info({}, `[lunr-recon] Loading index from "${this.filePath}"…`);
       const raw = JSON.parse(
         await fs.promises.readFile(this.filePath, "utf-8"),
       );
-      const index = lunr.Index.load(raw.index);
-      const uriToData = new Map<string, UriData>();
 
-      if (raw.uriToData) {
-        for (const [uri, data] of Object.entries(
-          raw.uriToData as Record<string, UriData & { altLabels?: string[] }>,
-        )) {
-          const fields: Record<string, string[]> = data.fields ?? {};
-          // Convert old { altLabels: string[] } format to fields.altLabel
-          if (
-            Array.isArray(data.altLabels) &&
-            data.altLabels.length > 0 &&
-            !fields.altLabel
-          ) {
-            fields.altLabel = data.altLabels;
-          }
-          uriToData.set(uri, {
-            label: data.label ?? uri,
-            fields,
-            types: data.types,
-          });
-        }
-      } else if (raw.uriToLabel) {
-        // Oldest cache format
-        for (const [uri, label] of Object.entries(
-          raw.uriToLabel as Record<string, string>,
-        )) {
-          uriToData.set(uri, { label, fields: {} });
-        }
+      if (!raw.groups || raw.version !== INDEX_VERSION) {
+        logger.warn(
+          {},
+          `[lunr-recon] Index file of an older format (version ${raw.version ?? 1}, expected ${INDEX_VERSION}) — rebuilding from SPARQL.`,
+        );
+        return null;
+      }
+
+      const groups: TypedIndex = new Map();
+      let entities = 0;
+      for (const [key, group] of Object.entries(
+        raw.groups as Record<
+          string,
+          { index: object; names: Record<string, string> }
+        >,
+      )) {
+        const names = new Map(Object.entries(group.names));
+        groups.set(key, { index: lunr.Index.load(group.index), names });
+        entities += names.size;
       }
 
       logger.info(
         {},
-        `[lunr-recon] Index loaded: ${uriToData.size} entity(ies).`,
+        `[lunr-recon] Index loaded: ${entities} entity(ies) in ${groups.size} group(s).`,
       );
-      return { index, uriToData };
+      return groups;
     } catch {
       logger.warn(
         {},
@@ -70,31 +72,34 @@ export class LunrIndexStore {
     }
   }
 
-  async save(
-    index: lunr.Index,
-    uriToData: Map<string, UriData>,
-  ): Promise<void> {
+  async save(groups: TypedIndex): Promise<void> {
     try {
       await fs.promises.mkdir(path.dirname(this.filePath), { recursive: true });
 
-      // Stream the JSON to disk instead of building one giant string in memory.
-      // With ~167k entities, JSON.stringify of the whole {index, uriToData}
-      // object peaked past the heap limit and crashed the server at save time.
-      // Here uriToData is serialized entity by entity, so the full JSON string
-      // never exists in RAM at once. The on-disk format is unchanged.
+      // Stream the JSON to disk instead of building one giant string in memory:
+      // each Lunr index is serialized on its own, and the names one by one, so
+      // the full JSON string never exists in RAM at once.
       const stream = fs.createWriteStream(this.filePath, { encoding: "utf-8" });
       const write = (chunk: string): Promise<void> =>
         new Promise((resolve, reject) => {
           stream.write(chunk, (err) => (err ? reject(err) : resolve()));
         });
 
-      await write(`{"index":${JSON.stringify(index.toJSON())},"uriToData":{`);
-      let first = true;
-      for (const [uri, data] of uriToData) {
+      await write(`{"version":${INDEX_VERSION},"groups":{`);
+      let firstGroup = true;
+      for (const [key, { index, names }] of groups) {
         await write(
-          `${first ? "" : ","}${JSON.stringify(uri)}:${JSON.stringify(data)}`,
+          `${firstGroup ? "" : ","}${JSON.stringify(key)}:{"index":${JSON.stringify(index.toJSON())},"names":{`,
         );
-        first = false;
+        let first = true;
+        for (const [uri, name] of names) {
+          await write(
+            `${first ? "" : ","}${JSON.stringify(uri)}:${JSON.stringify(name)}`,
+          );
+          first = false;
+        }
+        await write("}}");
+        firstGroup = false;
       }
       await write("}}");
 
